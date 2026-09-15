@@ -1004,7 +1004,7 @@ class CloudRunWorkerV2(
         logger: PrefectLogAdapter,
     ) -> Optional[str]:
         """
-        Return the resource name of the job's most recent execution.
+        Return the name of the job's most recent execution.
 
         Used by the submission retry path to detect whether a transient error
         masked a submission that actually succeeded.
@@ -1015,8 +1015,8 @@ class CloudRunWorkerV2(
             logger: The logger to use.
 
         Returns:
-            The resource name of the most recent execution, or None if the
-            job has not run before or the lookup fails.
+            The job's `latestCreatedExecution.name`, or None if the job has
+            not run before or the lookup fails.
         """
         try:
             job = _read_with_retry(
@@ -1066,8 +1066,9 @@ class CloudRunWorkerV2(
             logger: The logger to use.
 
         Returns:
-            The name of the newly created execution if the server started one
-            despite the error, so the caller can use it instead of retrying.
+            The full resource name of the newly created execution if the
+            server started one despite the error, so the caller can use it
+            instead of retrying.
             None if no new execution appeared, meaning a normal retry is safe.
 
         Raises:
@@ -1110,7 +1111,9 @@ class CloudRunWorkerV2(
             current,
             baseline_execution_name,
         )
-        return current
+        # `latestCreatedExecution.name` holds only the execution ID, while
+        # `ExecutionV2.get` requires the full resource name.
+        return f"{job.name}/executions/{current}"
 
     def _begin_job_execution(
         self,
@@ -1363,7 +1366,7 @@ class CloudRunWorkerV2(
             configuration: The configuration for the job.
         """
         # noinspection PyUnresolvedReferences
-        if exc.status_code == 404:
+        if isinstance(exc, HttpError) and exc.status_code == 404:
             pat1 = r"The requested URL [^ ]+ was not found on this server"
 
             if re.findall(pat1, str(exc)):

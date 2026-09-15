@@ -1,8 +1,12 @@
+import json
 from unittest import mock
 from unittest.mock import MagicMock
+from urllib.parse import urlparse
 
 import pytest
+from googleapiclient import discovery
 from googleapiclient.errors import HttpError
+from googleapiclient.http import HttpMockSequence
 from prefect_gcp.credentials import GcpCredentials
 from prefect_gcp.models.cloud_run_v2 import ExecutionV2, SecretKeySelector
 from prefect_gcp.utilities import slugify_name
@@ -1174,7 +1178,8 @@ class TestCloudRunWorkerV2SubmitJobRetries:
         mock_resp = MagicMock()
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
-        successful_submission = {"metadata": {"name": "test-execution"}}
+        execution_name = "projects/p/locations/l/jobs/j/executions/test-execution"
+        successful_submission = {"metadata": {"name": execution_name}}
 
         with (
             mock.patch(
@@ -1236,6 +1241,32 @@ class TestCloudRunWorkerV2SubmitJobRetries:
 
         assert mock_run.call_count == 1
         mock_sleep.assert_not_called()
+
+    def test_submit_job_reraises_non_http_errors(
+        self, cloud_run_worker_v2_job_config, mock_credentials
+    ):
+        worker = CloudRunWorkerV2("my-work-pool")
+        mock_client = MagicMock()
+        mock_logger = MagicMock(spec=PrefectLogAdapter)
+
+        with (
+            mock.patch(
+                "prefect_gcp.workers.cloud_run_v2.JobV2.get",
+                return_value=MagicMock(latestCreatedExecution={}),
+            ),
+            mock.patch(
+                "prefect_gcp.workers.cloud_run_v2.JobV2.run",
+                side_effect=TimeoutError("timed out"),
+            ) as mock_run,
+            pytest.raises(TimeoutError),
+        ):
+            worker._begin_job_execution(
+                cr_client=mock_client,
+                configuration=cloud_run_worker_v2_job_config,
+                logger=mock_logger,
+            )
+
+        assert mock_run.call_count == 1
 
     def test_submit_job_retries_until_max_attempts_then_raises(
         self, cloud_run_worker_v2_job_config, mock_credentials
@@ -1368,7 +1399,10 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
 
     @staticmethod
     def _job_with_execution(execution_name):
+        # As in a real jobs.get response, `name` is the full resource name and
+        # `latestCreatedExecution.name` is only the execution ID.
         job = MagicMock()
+        job.name = "projects/p/locations/l/jobs/j"
         job.latestCreatedExecution = (
             {"name": execution_name} if execution_name is not None else {}
         )
@@ -1385,8 +1419,8 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
 
-        baseline_name = "projects/p/locations/l/jobs/j/executions/exec-baseline"
-        new_name = "projects/p/locations/l/jobs/j/executions/exec-new"
+        baseline_name = "exec-baseline"
+        new_name = "exec-new"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1415,7 +1449,10 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         assert mock_job_get.call_count == 2
         mock_sleep.assert_not_called()
         mock_exec_get.assert_called_once()
-        assert mock_exec_get.call_args.kwargs["execution_id"] == new_name
+        assert (
+            mock_exec_get.call_args.kwargs["execution_id"]
+            == "projects/p/locations/l/jobs/j/executions/exec-new"
+        )
         assert result is mock_exec_get.return_value
 
         warning_messages = [call.args[0] for call in mock_logger.warning.call_args_list]
@@ -1431,9 +1468,10 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         mock_resp = MagicMock()
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
-        successful_submission = {"metadata": {"name": "test-execution"}}
+        execution_name = "projects/p/locations/l/jobs/j/executions/test-execution"
+        successful_submission = {"metadata": {"name": execution_name}}
 
-        baseline_name = "projects/p/locations/l/jobs/j/executions/exec-baseline"
+        baseline_name = "exec-baseline"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1459,7 +1497,7 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         assert mock_job_get.call_count == 2
         mock_sleep.assert_called_once()
         mock_exec_get.assert_called_once()
-        assert mock_exec_get.call_args.kwargs["execution_id"] == "test-execution"
+        assert mock_exec_get.call_args.kwargs["execution_id"] == execution_name
         assert result is mock_exec_get.return_value
 
         warning_messages = [call.args[0] for call in mock_logger.warning.call_args_list]
@@ -1488,7 +1526,8 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
         lookup_error = HttpError(resp=mock_resp, content=b"Service unavailable")
-        successful_submission = {"metadata": {"name": "test-execution"}}
+        execution_name = "projects/p/locations/l/jobs/j/executions/test-execution"
+        successful_submission = {"metadata": {"name": execution_name}}
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1509,7 +1548,7 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
                         )
 
         assert mock_run.call_count == 2
-        assert mock_exec_get.call_args.kwargs["execution_id"] == "test-execution"
+        assert mock_exec_get.call_args.kwargs["execution_id"] == execution_name
         assert result is mock_exec_get.return_value
         mock_logger.debug.assert_called()
         warning_messages = [call.args[0] for call in mock_logger.warning.call_args_list]
@@ -1536,7 +1575,7 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
         lookup_error = HttpError(resp=mock_resp, content=b"Service unavailable")
 
-        baseline_name = "projects/p/locations/l/jobs/j/executions/exec-baseline"
+        baseline_name = "exec-baseline"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1586,7 +1625,7 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
 
-        first_name = "projects/p/locations/l/jobs/j/executions/exec-first"
+        first_name = "exec-first"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1610,7 +1649,10 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
                         )
 
         assert mock_run.call_count == 1
-        assert mock_exec_get.call_args.kwargs["execution_id"] == first_name
+        assert (
+            mock_exec_get.call_args.kwargs["execution_id"]
+            == "projects/p/locations/l/jobs/j/executions/exec-first"
+        )
         assert result is mock_exec_get.return_value
         warning_messages = [call.args[0] for call in mock_logger.warning.call_args_list]
         assert any("duplicate run" in msg for msg in warning_messages)
@@ -1632,9 +1674,10 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         mock_resp = MagicMock()
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
-        successful_submission = {"metadata": {"name": "test-execution"}}
+        execution_name = "projects/p/locations/l/jobs/j/executions/test-execution"
+        successful_submission = {"metadata": {"name": execution_name}}
 
-        baseline_name = "projects/p/locations/l/jobs/j/executions/exec-baseline"
+        baseline_name = "exec-baseline"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1677,10 +1720,11 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         mock_resp = MagicMock()
         mock_resp.status = 503
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
-        successful_submission = {"metadata": {"name": "test-execution"}}
+        execution_name = "projects/p/locations/l/jobs/j/executions/test-execution"
+        successful_submission = {"metadata": {"name": execution_name}}
         execution = MagicMock(spec=ExecutionV2)
 
-        baseline_name = "projects/p/locations/l/jobs/j/executions/exec-baseline"
+        baseline_name = "exec-baseline"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1726,8 +1770,8 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         transient_error = HttpError(resp=mock_resp, content=b"Service unavailable")
         lookup_error = HttpError(resp=mock_resp, content=b"Service unavailable")
 
-        baseline_name = "projects/p/locations/l/jobs/j/executions/exec-baseline"
-        new_name = "projects/p/locations/l/jobs/j/executions/exec-new"
+        baseline_name = "exec-baseline"
+        new_name = "exec-new"
 
         with mock.patch(
             "prefect_gcp.workers.cloud_run_v2.JobV2.get",
@@ -1758,10 +1802,88 @@ class TestCloudRunWorkerV2SubmitJobRecovery:
         assert mock_job_get.call_count == 3
         mock_sleep.assert_called()
         mock_exec_get.assert_called_once()
-        assert mock_exec_get.call_args.kwargs["execution_id"] == new_name
+        assert (
+            mock_exec_get.call_args.kwargs["execution_id"]
+            == "projects/p/locations/l/jobs/j/executions/exec-new"
+        )
         assert result is mock_exec_get.return_value
         warning_messages = [call.args[0] for call in mock_logger.warning.call_args_list]
         assert any("duplicate run" in msg for msg in warning_messages)
+
+    def test_adopted_execution_is_fetched_by_full_resource_name(
+        self, cloud_run_worker_v2_job_config, mock_credentials
+    ):
+        # Uses a real discovery client instead of patching ExecutionV2.get, so
+        # googleapiclient checks the `name` passed to executions.get against
+        # the API's resource name pattern before sending the request.
+        worker = CloudRunWorkerV2("my-work-pool")
+        mock_logger = MagicMock(spec=PrefectLogAdapter)
+
+        job_name = (
+            f"projects/{cloud_run_worker_v2_job_config.project}"
+            f"/locations/{cloud_run_worker_v2_job_config.region}"
+            f"/jobs/{cloud_run_worker_v2_job_config.job_name}"
+        )
+        execution_id = f"{cloud_run_worker_v2_job_config.job_name}-abcde"
+        execution_name = f"{job_name}/executions/{execution_id}"
+
+        def job_response(latest_created_execution):
+            return json.dumps(
+                {
+                    "name": job_name,
+                    "uid": "job-uid",
+                    "generation": "1",
+                    "createTime": "2026-01-01T00:00:00Z",
+                    "updateTime": "2026-01-01T00:00:00Z",
+                    "template": {},
+                    "latestCreatedExecution": latest_created_execution,
+                    "etag": "job-etag",
+                }
+            )
+
+        http = HttpMockSequence(
+            [
+                # baseline jobs.get: the job has no execution yet
+                ({"status": "200"}, job_response({})),
+                # jobs.run fails even though the server started an execution
+                (
+                    {"status": "500"},
+                    json.dumps({"error": {"code": 500, "status": "INTERNAL"}}),
+                ),
+                # recovery jobs.get: reports the new execution by its ID only
+                ({"status": "200"}, job_response({"name": execution_id})),
+                # executions.get
+                (
+                    {"status": "200"},
+                    json.dumps(
+                        {
+                            "name": execution_name,
+                            "uid": "execution-uid",
+                            "generation": "1",
+                            "createTime": "2026-01-01T00:00:00Z",
+                            "job": cloud_run_worker_v2_job_config.job_name,
+                            "parallelism": 1,
+                            "taskCount": 1,
+                            "template": {},
+                            "logUri": "https://console.cloud.google.com/logs",
+                            "etag": "execution-etag",
+                        }
+                    ),
+                ),
+            ]
+        )
+        cr_client = discovery.build("run", "v2", http=http).projects().locations()
+
+        with mock.patch("prefect_gcp.workers.cloud_run_v2.time.sleep"):
+            result = worker._begin_job_execution(
+                cr_client=cr_client,
+                configuration=cloud_run_worker_v2_job_config,
+                logger=mock_logger,
+            )
+
+        assert result.name == execution_name
+        requested_uri = http.request_sequence[-1][0]
+        assert urlparse(requested_uri).path == f"/v2/{execution_name}"
 
 
 class TestCloudRunReadRetryEradication:
